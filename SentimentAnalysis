@@ -1,0 +1,156 @@
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torchtext.datasets import IMDB
+from torchtext.data.utils import get_tokenizer
+from torchtext.vocab import build_vocab_from_iterator
+from torch.nn.utils.rnn import pad_sequence
+# The IMDB dataset returns (label, text) pairs
+# label is 'pos' or 'neg', text is a raw review string.
+train_iter = IMDB(split='train')
+test_iter = IMDB(split='test')
+
+train_iter_for_vocab = IMDB(split='train')
+
+tokenizer = get_tokenizer('basic_english')
+
+
+def yield_tokens(data_iter):
+    for label, text in data_iter:
+        yield tokenizer(text)
+
+
+# Build vocabulary from training texts
+vocab = build_vocab_from_iterator(yield_tokens(train_iter_for_vocab),
+                                  specials=["<unk>", "<pad>", "<bos>", "<eos>"])
+vocab.set_default_index(vocab["<unk>"])
+
+# Convert label to a binary value
+def label_pipeline(label_str):
+    return 1 if label_str == 2 else 0
+
+
+# Convert text to list of token IDs
+def text_pipeline(text_str):
+    return vocab(tokenizer(text_str))
+
+full_train_list = list(IMDB(split='train'))
+print("Full training set length:", len(full_train_list)) #debug
+
+train_size = int(0.8 * len(full_train_list))
+valid_size = len(full_train_list) - train_size
+train_data, valid_data = random_split(full_train_list, [train_size, valid_size])
+
+test_data = list(test_iter)  # Convert test to a list for easy iteration
+
+print("Train length:", len(train_data))
+print("Valid length:", len(valid_data))
+print("Test length:", len(test_data)) #debug
+sample_label, sample_text = full_train_list[0]
+print("Sample label:", sample_label)
+print("Sample text:", sample_text[:400])
+for i in range(5):
+    label, text = full_train_list[i+998]
+    print(f"Sample {i}: label={label}, text_length={len(text)}")
+def collate_fn(batch):
+    # batch is a list of (label, text) pairs
+    labels = []
+    texts = []
+    for (label, text) in batch:
+        processed_text = torch.tensor(text_pipeline(text), dtype=torch.int64)
+        labels.append(label_pipeline(label))
+        texts.append(processed_text)
+
+    # Pad sequences to the same length
+    texts = pad_sequence(texts, batch_first=False, padding_value=vocab["<pad>"])
+    labels = torch.tensor(labels, dtype=torch.float)
+    return texts, labels
+
+BATCH_SIZE = 64
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+valid_loader = DataLoader(valid_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+test_loader = DataLoader(test_data, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+class LSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim, n_layers, bidirectional, dropout, pad_idx):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=n_layers, bidirectional=bidirectional, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim * 2 if bidirectional else hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, text):
+        # text shape: [seq_len, batch_size]
+        embedded = self.embedding(text)  # [seq_len, batch_size, embed_dim]
+        output, (hidden, cell) = self.lstm(embedded)
+        if self.lstm.bidirectional:
+            hidden = torch.cat((hidden[-2, :, :], hidden[-1, :, :]), dim=1)
+        else:
+            hidden = hidden[-1, :, :]
+        return self.fc(self.dropout(hidden))
+
+
+INPUT_DIM = len(vocab)
+EMBEDDING_DIM = 100
+HIDDEN_DIM = 256
+OUTPUT_DIM = 1
+N_LAYERS = 2
+BIDIRECTIONAL = True
+DROPOUT = 0.5
+PAD_IDX = vocab["<pad>"]
+
+model = LSTMClassifier(INPUT_DIM, EMBEDDING_DIM, HIDDEN_DIM, OUTPUT_DIM, N_LAYERS,
+                       BIDIRECTIONAL, DROPOUT, PAD_IDX).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.BCEWithLogitsLoss().to(device)
+
+
+def binary_accuracy(preds, y):
+    rounded_preds = torch.round(torch.sigmoid(preds))
+    correct = (rounded_preds == y).float()
+    return correct.sum() / len(correct)
+
+
+def train_epoch(model, loader, optimizer, criterion):
+    model.train()
+    epoch_loss, epoch_acc = 0, 0
+    for text, labels in loader:
+        text, labels = text.to(device), labels.to(device)
+        optimizer.zero_grad()
+        predictions = model(text).squeeze(1)
+        loss = criterion(predictions, labels)
+        acc = binary_accuracy(predictions, labels)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+        epoch_acc += acc.item()
+    return epoch_loss / len(loader), epoch_acc / len(loader)
+
+
+def evaluate(model, loader, criterion):
+    model.eval()
+    epoch_loss, epoch_acc = 0, 0
+    with torch.no_grad():
+        for text, labels in loader:
+            text, labels = text.to(device), labels.to(device)
+            predictions = model(text).squeeze(1)
+            loss = criterion(predictions, labels)
+            acc = binary_accuracy(predictions, labels)
+            epoch_loss += loss.item()
+            epoch_acc += acc.item()
+    return epoch_loss / len(loader), epoch_acc / len(loader)
+
+
+N_EPOCHS = 5
+for epoch in range(N_EPOCHS):
+    train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion)
+    valid_loss, valid_acc = evaluate(model, valid_loader, criterion)
+    print(f'Epoch {epoch + 1}:')
+    print(f'  Train Loss: {train_loss:.3f} | Train Acc: {train_acc * 100:.2f}%')
+    print(f'  Val. Loss: {valid_loss:.3f} | Val. Acc: {valid_acc * 100:.2f}%')
+
+test_loss, test_acc = evaluate(model, test_loader, criterion)
+print(f'Test Loss: {test_loss:.3f} | Test Acc: {test_acc * 100:.2f}%')
